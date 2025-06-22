@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # Parameter für den Balken
-L = 2.0     # Länge des Balkens [m]
+L = 5     # Länge des Balkens [m]
 E = 210e9         # Elastizitätsmodul [Pa]
 I = 1e-6          # Flächenträgheitsmoment [m^4]
 q = 1000          # Streckenlast [N/m]
@@ -29,6 +29,7 @@ class DNN(nn.Module):
 # Generierung von Kollokationspunkten (in dimensionsloser Form: z ∈ [0,1])
 def get_collocation_points(n_points):
     x = torch.linspace(0, 1, n_points, requires_grad=True).reshape(-1,1)
+    x.requires_grad_(True) 
     return x
 
 # Berechnung der analytischen Lösung (dimensionslos)
@@ -43,14 +44,9 @@ optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
 loss_fn = nn.MSELoss()
 
 n_collocation = 100
-x_coll = get_collocation_points(n_collocation)
+x_coll_ = get_collocation_points(n_collocation)
 
-n_epochs = 10000
-
-for epoch in range(n_epochs):
-    optimizer.zero_grad()
-
-    # Netzwerk-Ausgabe v(z)
+def loss_function(lambda_reg = 0.0, x_coll = x_coll_):
     v = net(x_coll)
 
     # Berechnung der 4. Ableitung von v(z) nach z
@@ -79,24 +75,76 @@ for epoch in range(n_epochs):
               loss_fn(dv0, torch.zeros_like(dv0)) + \
               loss_fn(ddv1, torch.zeros_like(ddv1)) + \
               loss_fn(dddv1, torch.zeros_like(dddv1))
+    
+    # L2-Regularisierung optional
+    l2_reg = torch.tensor(0.0, dtype=torch.float32)
+    for param in net.parameters():
+        l2_reg += torch.norm(param, 2)**2
 
-    loss = loss_residual + bc_loss
+    total_loss = loss_residual + bc_loss + lambda_reg * l2_reg
+    return total_loss, v, d1
+
+n_epochs = 5000
+loss_history = []
+loss_threshold = 1e-6  # Grenze für den Loss → anpassen je nach Problem
+
+for epoch in range(n_epochs):
+    optimizer.zero_grad()
+
+    loss, _, _ = loss_function(1e-3)
     loss.backward()
     optimizer.step()
 
-    if epoch % 1000 == 0:
-        print(f'Epoch {epoch}, Loss: {loss.item()}')
+    loss_history.append(loss.item())
+    if epoch % 500 == 0:
+        print(f'Epoch {epoch}, Loss: {loss.item():.6e}')
+
+    # Early stopping Kriterium
+    if loss.item() < loss_threshold:
+        print(f"Training abgebrochen bei Epoch {epoch} mit Loss: {loss.item():.6e}")
+        break
+
+final_loss_adam = loss.item()
+print(f"Final loss of Adam: {final_loss_adam:.6e}")
+
+# LBFGS-Optimierer für Feintuning
+optimizer_lbfgs = torch.optim.LBFGS(net.parameters(), max_iter=500, tolerance_grad=1e-9, tolerance_change=1e-9, history_size=50)
+
+def closure():
+    optimizer_lbfgs.zero_grad()
+    loss, _, _ = loss_function()
+    loss.backward()
+    return loss
+
+print("Start LBFGS ...")
+optimizer_lbfgs.step(closure)
+final_loss, _, _ = loss_function()
+print(f"Final loss after LBFGS: {final_loss.item():.6e}")
 
 # Auswertung
 z_eval = torch.linspace(0, 1, 100).reshape(-1,1)
 with torch.no_grad():
-    v_pred = net(z_eval).detach().numpy().flatten()
+    v_pred = np.array(net(z_eval).detach().numpy().flatten())
     v_exact = analytical_solution(z_eval).detach().numpy().flatten()
+
+print("Dimensionless solution v")
+mse = np.mean((v_pred- v_exact)**2)
+print(f"v: MSE: {mse:.6e}")
+print(f"v: RMSE: {np.sqrt(mse):.6e}")
 
 # Rücktransformation in dimensionalen Raum: w(x) = v(z) * w_char
 x_eval = z_eval.numpy().flatten() * L
 w_pred = v_pred * w_char
 w_exact = v_exact * w_char
+
+print("Dimensional solution w")
+# Relative Abweichung
+rel_error = np.linalg.norm(w_exact - w_pred, 2) / np.linalg.norm(w_exact, 2)
+print(f'w: Relative error: {rel_error:.2e}')
+
+mse = np.mean((w_pred- w_exact)**2)
+print(f"w: MSE: {mse:.6e}")
+print(f"w: RMSE: {np.sqrt(mse):.6e}")
 
 plt.figure(figsize=(8,5))
 plt.plot(x_eval, w_exact, label='Analytisch')
@@ -108,6 +156,11 @@ plt.grid(True)
 plt.title('Biegelinie eines Kragträgers unter gleichmäßiger Belastung')
 plt.show()
 
-# Relative Abweichung
-rel_error = np.linalg.norm(w_exact - w_pred, 2) / np.linalg.norm(w_exact, 2)
-print(f'Relative Fehlernorm: {rel_error:.2e}')
+plt.figure()
+plt.plot(loss_history)
+plt.yscale("log")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.title("Verlauf Loss (Adam)")
+plt.grid(True)
+plt.show()
