@@ -3,6 +3,10 @@ import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 
+# Startpunkt des Zufallszahlengenerators
+torch.manual_seed(42)
+np.random.seed(42)
+
 # Parameter für den Balken
 L = 5     # Länge des Balkens [m]
 E = 210e9         # Elastizitätsmodul [Pa]
@@ -29,7 +33,6 @@ class DNN(nn.Module):
 # Generierung von Kollokationspunkten (in dimensionsloser Form: z ∈ [0,1])
 def get_collocation_points(n_points):
     x = torch.linspace(0, 1, n_points, requires_grad=True).reshape(-1,1)
-    x.requires_grad_(True) 
     return x
 
 # Berechnung der analytischen Lösung (dimensionslos)
@@ -46,11 +49,13 @@ loss_fn = nn.MSELoss()
 n_collocation = 100
 x_coll_ = get_collocation_points(n_collocation)
 
-def loss_function(lambda_reg = 0.0, x_coll = x_coll_):
+def loss_function(lambda_reg = 0.0, x_coll = None):
+    if x_coll is None:
+        x_coll = x_coll_
     v = net(x_coll)
 
     # Berechnung der 4. Ableitung von v(z) nach z
-    d1 = torch.autograd.grad(v, x_coll, grad_outputs=torch.ones_like(v), create_graph=True)[0]
+    d1 = torch.autograd.grad(v, x_coll, grad_outputs=torch.ones_like(v), retain_graph=True, create_graph=True)[0]
     d2 = torch.autograd.grad(d1, x_coll, grad_outputs=torch.ones_like(d1), create_graph=True)[0]
     d3 = torch.autograd.grad(d2, x_coll, grad_outputs=torch.ones_like(d2), create_graph=True)[0]
     d4 = torch.autograd.grad(d3, x_coll, grad_outputs=torch.ones_like(d3), create_graph=True)[0]
@@ -77,9 +82,7 @@ def loss_function(lambda_reg = 0.0, x_coll = x_coll_):
               loss_fn(dddv1, torch.zeros_like(dddv1))
     
     # L2-Regularisierung optional
-    l2_reg = torch.tensor(0.0, dtype=torch.float32)
-    for param in net.parameters():
-        l2_reg += torch.norm(param, 2)**2
+    l2_reg = sum(torch.norm(param, 2)**2 for param in net.parameters())
 
     total_loss = loss_residual + bc_loss + lambda_reg * l2_reg
     return total_loss, v, d1
@@ -91,7 +94,7 @@ loss_threshold = 1e-6  # Grenze für den Loss → anpassen je nach Problem
 for epoch in range(n_epochs):
     optimizer.zero_grad()
 
-    loss, _, _ = loss_function(1e-3)
+    loss, _, _ = loss_function(1e-9)
     loss.backward()
     optimizer.step()
 
@@ -107,19 +110,20 @@ for epoch in range(n_epochs):
 final_loss_adam = loss.item()
 print(f"Final loss of Adam: {final_loss_adam:.6e}")
 
-# LBFGS-Optimierer für Feintuning
-optimizer_lbfgs = torch.optim.LBFGS(net.parameters(), max_iter=500, tolerance_grad=1e-9, tolerance_change=1e-9, history_size=50)
+if final_loss_adam > loss_threshold:
+    # LBFGS-Optimierer für Feintuning
+    optimizer_lbfgs = torch.optim.LBFGS(net.parameters(), max_iter=500, line_search_fn="strong_wolfe")
 
-def closure():
-    optimizer_lbfgs.zero_grad()
-    loss, _, _ = loss_function()
-    loss.backward()
-    return loss
+    def closure():
+        optimizer_lbfgs.zero_grad()
+        loss, _, _ = loss_function()
+        loss.backward()
+        return loss
 
-print("Start LBFGS ...")
-optimizer_lbfgs.step(closure)
-final_loss, _, _ = loss_function()
-print(f"Final loss after LBFGS: {final_loss.item():.6e}")
+    print("Start LBFGS ...")
+    optimizer_lbfgs.step(closure)
+    final_loss_lbfgs, _, _ = loss_function()
+    print(f"Final loss after LBFGS: {final_loss_lbfgs:.6e}")
 
 # Auswertung
 z_eval = torch.linspace(0, 1, 100).reshape(-1,1)
@@ -154,6 +158,17 @@ plt.ylabel('w(x) [m]')
 plt.legend()
 plt.grid(True)
 plt.title('Biegelinie eines Kragträgers unter gleichmäßiger Belastung')
+plt.show()
+
+plt.figure(figsize=(8,5))
+plt.plot(x_eval, w_exact, label='Analytische Lösung', linewidth=2)
+plt.plot(x_eval, w_pred, '--', label='PINN', linewidth=2)
+plt.xlabel('x [m]')
+plt.ylabel('w(x) [m]')
+plt.legend()
+plt.grid(True, which='both', linestyle='--')
+plt.title('Biegelinie eines Kragträgers unter gleichmäßiger Belastung')
+plt.tight_layout()
 plt.show()
 
 plt.figure()
